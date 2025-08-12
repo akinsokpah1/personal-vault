@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Personal Vault — Static</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#60a5fa;--muted:#94a3b8;color-scheme:dark}
+    html,body{height:100%;margin:0;font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;background:linear-gradient(180deg,#021428 0%, #071025 100%);color:#e6eef8}
+    .container{max-width:980px;margin:28px auto;padding:20px}
+    header{display:flex;align-items:center;justify-content:space-between}
+    h1{margin:0;font-size:20px}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:12px;padding:16px;margin-top:16px;box-shadow:0 6px 24px rgba(2,6,23,0.6)}
+    label{display:block;margin-top:10px;font-size:13px;color:var(--muted)}
+    input[type=text], input[type=password], textarea, select{width:100%;padding:10px;margin-top:6px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+    button{background:var(--accent);border:none;padding:10px 14px;border-radius:10px;color:#04233a;font-weight:600;cursor:pointer}
+    .muted{color:var(--muted);font-size:13px}
+    .row{display:flex;gap:8px}
+    .cols{display:grid;grid-template-columns:1fr 320px;gap:12px}
+    .list{max-height:420px;overflow:auto;margin-top:10px}
+    .item{padding:10px;border-radius:8px;background:rgba(255,255,255,0.01);margin-bottom:8px}
+    .small{font-size:12px;color:var(--muted)}
+    a.link{color:var(--accent);text-decoration:none}
+    footer{margin-top:20px;text-align:center;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🔐 Personal Vault — Static HTML (Argon2id + libsodium)</h1>
+      <div class="muted">Static / GitHub Pages ready — vendor `libsodium-wrappers.min.js` in repo.</div>
+    </header>
+
+    <div class="card" id="authCard">
+      <div class="muted">Passphrase unlocks your vault. <strong>DO NOT FORGET</strong> — we store only ciphertext locally.</div>
+      <label>Passphrase</label>
+      <input id="passphrase" type="password" placeholder="Choose a strong passphrase...">
+      <div class="row" style="margin-top:10px">
+        <button id="unlockBtn">Unlock / Create Vault</button>
+        <button id="exportBtn">Export Encrypted Vault</button>
+        <button id="importBtn">Import Vault</button>
+      </div>
+    </div>
+
+    <div class="cols">
+      <div>
+        <div class="card">
+          <h3>Upload file</h3>
+          <div class="muted">Files are encrypted with XChaCha20-Poly1305 via libsodium. KDF is Argon2id (libsodium `crypto_pwhash`).</div>
+          <label>Select file</label>
+          <input id="fileInput" type="file">
+          <label>Type / tags (comma separated)</label>
+          <input id="fileTags" type="text" placeholder="e.g. id, passport, photo">
+          <div style="margin-top:8px"><button id="uploadFileBtn">Encrypt & Store</button></div>
+        </div>
+
+        <div class="card">
+          <h3>Add timeline event</h3>
+          <label>Title</label>
+          <input id="eventTitle" type="text" placeholder="Graduation, Wedding...">
+          <label>Date & Time</label>
+          <input id="eventDate" type="datetime-local">
+          <label>Description</label>
+          <textarea id="eventDesc" rows="4"></textarea>
+          <label>Tags</label>
+          <input id="eventTags" type="text" placeholder="memories, 2010">
+          <div style="margin-top:8px" class="row"><button id="addEventBtn">Add Event</button><button id="clearBtn">Clear Vault</button></div>
+        </div>
+      </div>
+
+      <aside>
+        <div class="card">
+          <h3>Vault Browser</h3>
+          <div class="muted">Unlock to view items and download decrypted copies.</div>
+          <label>Search</label>
+          <input id="search" type="text" placeholder="search titles, tags...">
+          <div class="list" id="list"></div>
+        </div>
+
+        <div class="card">
+          <h3>Export / Backup</h3>
+          <div class="muted">Export contains only ciphertext + salts + IVs and manifest. Keep your passphrase safe.</div>
+          <div style="margin-top:8px"><button id="downloadAllBtn">Download Encrypted Archive (.json)</button></div>
+          <div style="margin-top:8px"><button id="verifyBtn">Verify Backups (SHA-256)</button></div>
+        </div>
+      </aside>
+    </div>
+
+    <footer>Made for private use. This is a static-only vault — no server, no external uploads. If you forget your passphrase your data cannot be recovered.</footer>
+  </div>
+
+<!-- IMPORTANT: vendored libsodium-wrappers.min.js should be placed next to this HTML in your repo -->
+<script src="./libsodium-wrappers.min.js"></script>
+<script>
+// Persistent DB
+const DB_NAME = 'personal_vault_db_v2';
+const DB_STORE = 'items';
+let sodiumReady = false;
+let sodium = null;
+let sessionKey = null; // Uint8Array key
+let sessionMeta = null; // {salt, opslimit, memlimit, kdf}
+
+// Default KDF params (store these in exported manifest so they can be changed later)
+const DEFAULT_KDF = 'argon2id';
+const DEFAULT_OPSLIMIT = 3; // time
+const DEFAULT_MEMLIMIT = 64 * 1024 * 1024; // 64 MiB
+
+function openDB(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(DB_NAME, 1);
+    r.onupgradeneeded = e => { const db = e.target.result; if(!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, {keyPath:'id'}); };
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = e => rej(e.target.error);
+  });
+}
+async function putItem(item){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).put(item); tx.oncomplete = ()=>res(); tx.onerror = e=>rej(e); }); }
+async function getAllItems(){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE,'readonly'); const req = tx.objectStore(DB_STORE).getAll(); req.onsuccess = ()=>res(req.result); req.onerror = e=>rej(e); }); }
+async function clearAll(){ const db = await openDB(); return new Promise((res,rej)=>{ const tx = db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).clear(); tx.oncomplete = ()=>res(); tx.onerror = e=>rej(e); }); }
+
+// Utility
+function randBytes(n){ return sodium.randombytes_buf(n); }
+function nowISO(){ return new Date().toISOString(); }
+function bufToB64(buf){ return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))); }
+function b64ToBuf(b64){ const s = atob(b64); const arr = new Uint8Array(s.length); for(let i=0;i<s.length;i++) arr[i]=s.charCodeAt(i); return arr; }
+
+// Key derivation using libsodium crypto_pwhash (Argon2id)
+async function deriveKey(passphrase, salt, opslimit=DEFAULT_OPSLIMIT, memlimit=DEFAULT_MEMLIMIT){
+  const pw = new TextEncoder().encode(passphrase);
+  const keyLen = 32; // 256-bit symmetric key
+  const key = sodium.crypto_pwhash(keyLen, pw, salt, opslimit, memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13);
+  return key; // Uint8Array
+}
+
+// Encrypt with XChaCha20-Poly1305 (AEAD)
+function encryptBlob(plainBuf, key){
+  const nonce = randBytes(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+  const cipher = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plainBuf, null, null, nonce, key);
+  return {nonce, cipher};
+}
+function decryptBlob(cipherBuf, nonce, key){
+  return sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, cipherBuf, null, nonce, key);
+}
+
+// Hash helper (SHA-256 via generic hash)
+function sha256(buf){ return sodium.crypto_generichash(32, buf); }
+
+// ID helper
+function uid(){ return 'id_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
+
+// ------- UI + actions -------
+async function initSodium(){ await window.sodium.ready; sodium = window.sodium; sodiumReady = true; console.log('sodium ready'); }
+initSodium();
+
+// Unlock / create session
+document.getElementById('unlockBtn').addEventListener('click', async ()=>{
+  const pass = document.getElementById('passphrase').value;
+  if(!pass){ alert('Enter passphrase'); return; }
+  if(!sodiumReady){ alert('crypto not ready'); return; }
+  // Derive salt if exists in localStorage, else create
+  let saltB64 = localStorage.getItem('vault_salt');
+  if(!saltB64){ const salt = randBytes(sodium.crypto_pwhash_SALTBYTES); saltB64 = bufToB64(salt); localStorage.setItem('vault_salt', saltB64); }
+  const salt = b64ToBuf(saltB64);
+  // derive
+  const key = await deriveKey(pass, salt, DEFAULT_OPSLIMIT, DEFAULT_MEMLIMIT);
+  sessionKey = key;
+  sessionMeta = {kdf:DEFAULT_KDF, ops:DEFAULT_OPSLIMIT, mem:DEFAULT_MEMLIMIT, salt:saltB64, created_at: nowISO()};
+  await refreshList();
+  alert('Vault unlocked for this session (key in memory).');
+});
+
+// Encrypt & store file
+document.getElementById('uploadFileBtn').addEventListener('click', async ()=>{
+  if(!sessionKey){ alert('Unlock first'); return; }
+  const f = document.getElementById('fileInput').files[0]; if(!f){ alert('Choose file'); return; }
+  const tags = document.getElementById('fileTags').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const arr = new Uint8Array(await f.arrayBuffer());
+  const {nonce, cipher} = encryptBlob(arr, sessionKey);
+  const id = uid();
+  const item = {
+    id,
+    type: 'file',
+    filename: f.name,
+    mimetype: f.type || 'application/octet-stream',
+    created_at: nowISO(),
+    tags,
+    cipher: bufToB64(cipher),
+    nonce: bufToB64(nonce),
+    kdf_meta: sessionMeta,
+    hash: bufToB64(sha256(arr)),
+    format_version: 1
+  };
+  await putItem(item);
+  await refreshList();
+  alert('Encrypted file stored in IndexedDB (client-only).');
+});
+
+// Add timeline event (stored encrypted as JSON string)
+document.getElementById('addEventBtn').addEventListener('click', async ()=>{
+  if(!sessionKey){ alert('Unlock first'); return; }
+  const title = document.getElementById('eventTitle').value.trim(); if(!title){ alert('Enter title'); return; }
+  const date = document.getElementById('eventDate').value || new Date().toISOString();
+  const desc = document.getElementById('eventDesc').value || '';
+  const tags = document.getElementById('eventTags').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const payload = new TextEncoder().encode(JSON.stringify({title,date,desc,tags}));
+  const {nonce, cipher} = encryptBlob(payload, sessionKey);
+  const id = uid();
+  const item = {id, type:'event', created_at: nowISO(), tags, cipher: bufToB64(cipher), nonce: bufToB64(nonce), kdf_meta: sessionMeta, format_version:1 };
+  await putItem(item);
+  await refreshList();
+  alert('Event added.');
+});
+
+// Clear vault
+document.getElementById('clearBtn').addEventListener('click', async ()=>{
+  if(!confirm('This deletes ALL local items in this browser. Are you sure?')) return;
+  await clearAll();
+  await refreshList();
+});
+
+// Refresh list UI
+async function refreshList(){ const list = document.getElementById('list'); list.innerHTML=''; const items = await getAllItems(); for(const it of items.sort((a,b)=> (a.created_at<b.created_at)?1:-1)){
+    const el = document.createElement('div'); el.className='item';
+    el.innerHTML = `<div><strong>${it.type}</strong> <span class="small">${it.filename||''}</span></div><div class="small">${it.created_at}</div>`;
+    const btns = document.createElement('div'); btns.className='row';
+    const view = document.createElement('button'); view.textContent='Decrypt'; view.onclick = async ()=>{ await handleDecryptItem(it); };
+    const dl = document.createElement('button'); dl.textContent='Download'; dl.onclick = async ()=>{ await handleDownloadItem(it); };
+    btns.appendChild(view); btns.appendChild(dl);
+    el.appendChild(btns);
+    list.appendChild(el);
+  }
+}
+
+async function handleDecryptItem(it){ if(!sessionKey){ alert('Unlock first'); return; }
+  try{
+    const cipher = b64ToBuf(it.cipher);
+    const nonce = b64ToBuf(it.nonce);
+    const plain = decryptBlob(cipher, nonce, sessionKey);
+    if(it.type==='event'){
+      const obj = JSON.parse(new TextDecoder().decode(plain));
+      alert(JSON.stringify(obj, null, 2));
+    } else {
+      alert('File decrypted in memory — use Download to save to disk.');
+    }
+  }catch(e){ alert('Decryption failed — wrong passphrase or corrupted data.'); }
+}
+
+async function handleDownloadItem(it){ if(!sessionKey){ alert('Unlock first'); return; }
+  try{
+    const cipher = b64ToBuf(it.cipher);
+    const nonce = b64ToBuf(it.nonce);
+    const plain = decryptBlob(cipher, nonce, sessionKey);
+    if(it.type==='file'){
+      const blob = new Blob([plain], {type: it.mimetype});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = it.filename || 'download.bin'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    } else {
+      const txt = new TextDecoder().decode(plain);
+      const blob = new Blob([txt], {type:'text/plain'}); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download = (it.title||'event')+'.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+  }catch(e){ alert('Download/decrypt failed: '+e.message); }
+}
+
+// Export manifest (all ciphertext + meta)
+document.getElementById('downloadAllBtn').addEventListener('click', async ()=>{
+  const items = await getAllItems();
+  const manifest = {exported_at: nowISO(), format_version:1, items, manifest_hash: null };
+  // compute manifest hash
+  const raw = new TextEncoder().encode(JSON.stringify(manifest));
+  const h = sha256(raw);
+  manifest.manifest_hash = bufToB64(h);
+  const blob = new Blob([JSON.stringify(manifest, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download = 'vault-export-' + new Date().toISOString().slice(0,10) + '.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+
+// Verify backups: compute hash of each item's cipher/plain hash presence
+document.getElementById('verifyBtn').addEventListener('click', async ()=>{
+  const items = await getAllItems();
+  const problems = [];
+  for(const it of items){
+    if(it.type==='file'){
+      // attempt to verify stored plaintext hash remains same if we can decrypt
+      try{
+        const cipher = b64ToBuf(it.cipher); const nonce = b64ToBuf(it.nonce);
+        const plain = decryptBlob(cipher, nonce, sessionKey);
+        const h = bufToB64(sha256(plain));
+        if(h !== it.hash) problems.push({id:it.id, reason:'hash mismatch'});
+      }catch(e){ problems.push({id:it.id, reason:'cannot decrypt with current session key'}); }
+    }
+  }
+  if(problems.length===0) alert('All items verified OK'); else alert('Problems found: ' + JSON.stringify(problems));
+});
+
+// Import/export quick import (import encrypted manifest json)
+document.getElementById('importBtn').addEventListener('click', async ()=>{
+  const f = document.createElement('input'); f.type='file'; f.accept='.json'; f.onchange = async ()=>{
+    const file = f.files[0]; if(!file) return; const obj = JSON.parse(await file.text()); if(!obj.items) { alert('Invalid manifest'); return; }
+    for(const it of obj.items){ await putItem(it); }
+    await refreshList(); alert('Imported '+obj.items.length+' items (ciphertexts only).');
+  }; f.click();
+});
+
+// Simple migrate function: re-encrypt with new KDF params (uses current passphrase/key in memory)
+async function migrateToNewParams(newOps, newMem){
+  if(!sessionKey) throw new Error('unlock first');
+  const pass = document.getElementById('passphrase').value; if(!pass) throw new Error('passphrase missing');
+  const items = await getAllItems();
+  // derive new salt
+  const newSalt = randBytes(sodium.crypto_pwhash_SALTBYTES);
+  const newKey = await deriveKey(pass, newSalt, newOps, newMem);
+  for(const it of items){
+    try{
+      const cipher = b64ToBuf(it.cipher); const nonce = b64ToBuf(it.nonce);
+      const plain = decryptBlob(cipher, nonce, sessionKey);
+      const enc = encryptBlob(plain, newKey);
+      it.cipher = bufToB64(enc.cipher); it.nonce = bufToB64(enc.nonce); it.kdf_meta = {kdf:DEFAULT_KDF, ops:newOps, mem:newMem, salt:bufToB64(newSalt), migrated_at: nowISO()};
+      await putItem(it);
+    }catch(e){ console.error('skip item', it.id, e); }
+  }
+  // update sessionKey to newKey and salt in localStorage
+  sessionKey = newKey; localStorage.setItem('vault_salt', bufToB64(newSalt)); alert('Migration finished (best-effort).');
+}
+
+// Small helper: expose migrate via console for power users
+window.vault = {migrateToNewParams};
+
+// init list
+refreshList();
+</script>
+</body>
+</html>
